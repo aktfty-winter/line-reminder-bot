@@ -2,11 +2,10 @@ import os
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent, LeaveEvent
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import date, datetime, timedelta
 import psycopg2
-import psycopg2.extras
 
 app = Flask(__name__)
 
@@ -28,23 +27,18 @@ def init_db():
     cur.execute("""
         CREATE TABLE IF NOT EXISTS projects (
             id SERIAL PRIMARY KEY,
-            chat_id TEXT NOT NULL,
             name TEXT NOT NULL,
             deadline DATE NOT NULL
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS groups (
+            group_id TEXT PRIMARY KEY
         )
     """)
     conn.commit()
     cur.close()
     conn.close()
-
-
-def get_chat_id(event):
-    src = event.source
-    if src.type == "group":
-        return src.group_id
-    elif src.type == "room":
-        return src.room_id
-    return src.user_id
 
 
 @app.route("/callback", methods=["POST"])
@@ -58,13 +52,45 @@ def callback():
     return "OK"
 
 
+# 機器人被加進群組時，記錄群組 ID
+@handler.add(JoinEvent)
+def handle_join(event):
+    if event.source.type == "group":
+        group_id = event.source.group_id
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO groups (group_id) VALUES (%s) ON CONFLICT DO NOTHING",
+            (group_id,)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+
+# 機器人被踢出群組時，移除群組 ID
+@handler.add(LeaveEvent)
+def handle_leave(event):
+    if event.source.type == "group":
+        group_id = event.source.group_id
+        conn = get_db()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM groups WHERE group_id = %s", (group_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+
+# 只接受私訊的管理指令，群組訊息一律忽略
 @handler.add(MessageEvent, message=TextMessage)
 def handle_message(event):
-    chat_id = get_chat_id(event)
+    if event.source.type != "user":
+        return
+
+    user_id = event.source.user_id
     text = event.message.text.strip()
 
     if text.startswith("新增 "):
-        # 格式：新增 臨終問答第二波-一校 2024-05-31
         parts = text.split(" ", 2)
         if len(parts) == 3:
             name, deadline_str = parts[1], parts[2]
@@ -73,8 +99,8 @@ def handle_message(event):
                 conn = get_db()
                 cur = conn.cursor()
                 cur.execute(
-                    "INSERT INTO projects (chat_id, name, deadline) VALUES (%s, %s, %s) RETURNING id",
-                    (chat_id, name, deadline)
+                    "INSERT INTO projects (name, deadline) VALUES (%s, %s) RETURNING id",
+                    (name, deadline)
                 )
                 pid = cur.fetchone()[0]
                 conn.commit()
@@ -96,10 +122,7 @@ def handle_message(event):
     elif text == "查看":
         conn = get_db()
         cur = conn.cursor()
-        cur.execute(
-            "SELECT id, name, deadline FROM projects WHERE chat_id = %s ORDER BY deadline",
-            (chat_id,)
-        )
+        cur.execute("SELECT id, name, deadline FROM projects ORDER BY deadline")
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -117,17 +140,14 @@ def handle_message(event):
                 lines.append(f"#{pid} {name}\n　{deadline.month}/{deadline.day}（{status}）")
             reply = "📋 專案清單：\n\n" + "\n\n".join(lines)
         else:
-            reply = "目前沒有任何專案。\n輸入「說明」查看指令。"
+            reply = "目前沒有任何專案。"
 
     elif text.startswith("刪除 "):
         try:
             pid = int(text.split(" ")[1])
             conn = get_db()
             cur = conn.cursor()
-            cur.execute(
-                "DELETE FROM projects WHERE id = %s AND chat_id = %s RETURNING name",
-                (pid, chat_id)
-            )
+            cur.execute("DELETE FROM projects WHERE id = %s RETURNING name", (pid,))
             row = cur.fetchone()
             conn.commit()
             cur.close()
@@ -138,13 +158,13 @@ def handle_message(event):
 
     else:
         reply = (
-            "📌 指令說明：\n\n"
+            "📌 指令說明（私訊使用）：\n\n"
             "• 新增 專案名稱 YYYY-MM-DD\n"
             "  例：新增 臨終問答一校 2024-05-31\n\n"
             "• 查看\n\n"
             "• 刪除 編號\n"
             "  例：刪除 1\n\n"
-            "⏰ 提醒時機：\n"
+            "⏰ 提醒時機（推播到群組）：\n"
             "截止前 7天、5天、3天（早上 9:00）\n"
             "截止當天（早上 8:00）"
         )
@@ -158,33 +178,37 @@ def handle_message(event):
 def send_reminders():
     today = date.today()
     now_hour = datetime.now().hour
+
     conn = get_db()
     cur = conn.cursor()
 
+    # 取得所有群組
+    cur.execute("SELECT group_id FROM groups")
+    group_ids = [row[0] for row in cur.fetchall()]
+
+    messages = []
+
     if now_hour == 8:
-        # 截止當天
-        cur.execute("SELECT chat_id, name, deadline FROM projects WHERE deadline = %s", (today,))
-        for chat_id, name, deadline in cur.fetchall():
-            msg = f"🔴 今天截止！\n{name}\n截止日：{deadline.month}/{deadline.day}"
-            try:
-                line_bot_api.push_message(chat_id, TextSendMessage(text=msg))
-            except Exception as e:
-                print(f"Push error: {e}")
+        cur.execute("SELECT name, deadline FROM projects WHERE deadline = %s", (today,))
+        for name, deadline in cur.fetchall():
+            messages.append(f"🔴 今天截止！\n{name}\n截止日：{deadline.month}/{deadline.day}")
 
     elif now_hour == 9:
-        # 截止前 3、5、7 天
         for days in [3, 5, 7]:
             target = today + timedelta(days=days)
-            cur.execute("SELECT chat_id, name, deadline FROM projects WHERE deadline = %s", (target,))
-            for chat_id, name, deadline in cur.fetchall():
-                msg = f"⚠️ {name} 距離{deadline.month}/{deadline.day}截止日還有{days}天"
-                try:
-                    line_bot_api.push_message(chat_id, TextSendMessage(text=msg))
-                except Exception as e:
-                    print(f"Push error: {e}")
+            cur.execute("SELECT name, deadline FROM projects WHERE deadline = %s", (target,))
+            for name, deadline in cur.fetchall():
+                messages.append(f"⚠️ {name} 距離{deadline.month}/{deadline.day}截止日還有{days}天")
 
     cur.close()
     conn.close()
+
+    for group_id in group_ids:
+        for msg in messages:
+            try:
+                line_bot_api.push_message(group_id, TextSendMessage(text=msg))
+            except Exception as e:
+                print(f"Push error: {e}")
 
 
 scheduler = BackgroundScheduler(timezone="Asia/Taipei")
