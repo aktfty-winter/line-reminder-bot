@@ -6,6 +6,9 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage, JoinEvent
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import date, datetime, timedelta
 import psycopg2
+import pytz
+
+TAIPEI = pytz.timezone("Asia/Taipei")
 
 app = Flask(__name__)
 
@@ -58,6 +61,12 @@ def get_group_id_by_name(cur, name):
     cur.execute("SELECT group_id FROM groups WHERE name = %s", (name,))
     row = cur.fetchone()
     return row[0] if row else None
+
+
+@app.route("/ping", methods=["GET"])
+def ping():
+    print(f"[Ping] {datetime.now(TAIPEI).strftime('%Y-%m-%d %H:%M:%S')}")
+    return "pong", 200
 
 
 @app.route("/callback", methods=["POST"])
@@ -322,8 +331,10 @@ def handle_message(event):
 
 
 def send_reminders():
-    today = date.today()
-    now_hour = datetime.now().hour
+    now = datetime.now(TAIPEI)
+    today = now.date()
+    now_hour = now.hour
+    print(f"[排程觸發] {now.strftime('%Y-%m-%d %H:%M:%S')} hour={now_hour}")
     conn = get_db()
     cur = conn.cursor()
 
