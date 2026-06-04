@@ -4,3 +4,4 @@ apscheduler
 gunicorn
 psycopg2-binary
 pytz
+requests
