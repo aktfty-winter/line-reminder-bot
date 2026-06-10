@@ -471,16 +471,7 @@ def handle_message(event):
                     )
                     row = cur.fetchone()
                     conn.commit()
-                    if row:
-                        proj_name = row[0]
-                        reply = f"✅ 已刪除【{group_name}】專案 #{pid}「{proj_name}」\n慶功訊息已推播至群組 🎉"
-                        congrats_msg = random.choice(CONGRATS_MSGS).format(name=proj_name)
-                        try:
-                            push_message(group_id, congrats_msg)
-                        except Exception as e:
-                            print(f"Congrats push error: {e}")
-                    else:
-                        reply = f"在「{group_name}」找不到專案 #{pid}。"
+                    reply = f"✅ 已刪除【{group_name}】專案 #{pid}「{row[0]}」" if row else f"在「{group_name}」找不到專案 #{pid}。"
                 cur.close()
                 conn.close()
             except ValueError:
