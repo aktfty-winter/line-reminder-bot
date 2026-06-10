@@ -1,4 +1,5 @@
 import os
+import random
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -9,6 +10,15 @@ from collections import defaultdict
 import psycopg2
 import pytz
 import requests as req
+
+CONGRATS_MSGS = [
+    "🎉 任務完成！\n「{name}」已順利結案！\n謝謝大家的努力與配合，辛苦了 ✨\n（順帶一提，這幾天的提醒轟炸也是我的功勞，不客氣 😎）",
+    "🌟 完工了！\n「{name}」完美收尾 🎊\n感謝各位的付出，你們最棒了！\n（我這個盡責的鬧鐘機器人也默默流下感動的眼淚）",
+    "🎊 大功告成！\n「{name}」任務圓滿！\n謝謝每個人的辛苦，繼續加油 💪\n（謝謝我自己每天準時報時，沒有功勞也有苦勞 🤖）",
+    "✅ 任務結案！\n「{name}」搞定！\n感謝大家的配合，辛苦了 🥳\n（也謝謝這位每天碎碎念提醒大家的機器人，它真的很棒 👏）",
+    "🏁 終於結束了！\n「{name}」正式畢業！\n大家辛苦了，可以暫時不用看到我了（但我會想你們的）👋",
+    "🥳 收工慶祝！\n「{name}」完成啦！\n感謝大家沒有把我設成靜音，讓提醒發揮了作用 📣",
+]
 
 TAIPEI = pytz.timezone("Asia/Taipei")
 
@@ -31,24 +41,65 @@ def today_taipei():
 
 
 def parse_reminder_type(s):
-    """支援空白或逗號隔開的天數，例如 '14 7 3 1' 或 '14,7,3,1'"""
+    """
+    支援以下格式：
+    - '週五'           → 每週五提醒
+    - '14 7 3 1'       → 截止前指定天數
+    - '週五 7 1'       → 每週五 + 截止前指定天數（混合）
+    """
     s = s.strip()
-    if s == "週五":
-        return s, None
-    s_normalized = s.replace(" ", ",")
-    try:
-        days = [int(d.strip()) for d in s_normalized.split(",") if d.strip()]
-        if days and all(d > 0 for d in days):
-            return ",".join(str(d) for d in sorted(set(days), reverse=True)), None
-    except ValueError:
-        pass
-    return None, "提醒設定格式錯誤\n請用「週五」或天數如「14 7 3 1」"
+    tokens = s.replace(",", " ").split()
+
+    has_weekly = "週五" in tokens
+    day_tokens = [t for t in tokens if t != "週五"]
+
+    if day_tokens:
+        try:
+            days = [int(d) for d in day_tokens]
+            if not all(d > 0 for d in days):
+                return None, "天數必須是正整數"
+            days_str = ",".join(str(d) for d in sorted(set(days), reverse=True))
+        except ValueError:
+            return None, "提醒設定格式錯誤\n請用「週五」、天數如「14 7 3 1」，或混合如「週五 7 1」"
+    else:
+        days_str = ""
+
+    if not has_weekly and not days_str:
+        return None, "提醒設定不能為空"
+
+    if has_weekly and days_str:
+        return f"週五+{days_str}", None
+    elif has_weekly:
+        return "週五", None
+    else:
+        return days_str, None
 
 
 def format_reminder_type(reminder_type):
     if reminder_type == "週五":
         return "每週五提醒"
+    if reminder_type.startswith("週五+"):
+        days = reminder_type[3:].replace(",", " ")
+        return f"每週五 + 截止前 {days} 天提醒"
     return f"截止前 {reminder_type.replace(',', ' ')} 天提醒"
+
+
+def extract_days(reminder_type):
+    """從 reminder_type 取出特定天數列表"""
+    if reminder_type.startswith("週五+"):
+        days_part = reminder_type[3:]
+    elif reminder_type == "週五":
+        return []
+    else:
+        days_part = reminder_type
+    try:
+        return [int(d.strip()) for d in days_part.split(",") if d.strip()]
+    except ValueError:
+        return []
+
+
+def has_weekly(reminder_type):
+    return reminder_type == "週五" or reminder_type.startswith("週五+")
 
 
 def format_mention_all(mention_all):
@@ -420,13 +471,44 @@ def handle_message(event):
                     )
                     row = cur.fetchone()
                     conn.commit()
-                    reply = f"✅ 已刪除【{group_name}】專案 #{pid}「{row[0]}」" if row else f"在「{group_name}」找不到專案 #{pid}。"
+                    if row:
+                        proj_name = row[0]
+                        reply = f"✅ 已刪除【{group_name}】專案 #{pid}「{proj_name}」\n慶功訊息已推播至群組 🎉"
+                        congrats_msg = random.choice(CONGRATS_MSGS).format(name=proj_name)
+                        try:
+                            push_message(group_id, congrats_msg)
+                        except Exception as e:
+                            print(f"Congrats push error: {e}")
+                    else:
+                        reply = f"在「{group_name}」找不到專案 #{pid}。"
                 cur.close()
                 conn.close()
             except ValueError:
                 reply = "格式：刪除 群組名 編號\n例：刪除 法務一組 1"
         else:
             reply = "格式：刪除 群組名 編號\n例：刪除 法務一組 1"
+
+    # ── 結案 群組名 專案名稱 ──
+    elif text.startswith("結案 "):
+        parts = text.split(" ", 2)
+        if len(parts) == 3:
+            group_name, proj_name = parts[1], parts[2]
+            conn = get_db()
+            cur = conn.cursor()
+            group_id = get_group_id_by_name(cur, group_name)
+            cur.close()
+            conn.close()
+            if not group_id:
+                reply = f"找不到群組「{group_name}」。"
+            else:
+                congrats_msg = random.choice(CONGRATS_MSGS).format(name=proj_name)
+                try:
+                    push_message(group_id, congrats_msg)
+                    reply = f"✅ 已補發慶功訊息到【{group_name}】"
+                except Exception as e:
+                    reply = f"推播失敗：{e}"
+        else:
+            reply = "格式：結案 群組名 專案名稱\n例：結案 法務一組 臨終問答一校"
 
     # ── 測試 / 測試 群組名 ──
     elif text == "測試" or text.startswith("測試 "):
@@ -456,7 +538,7 @@ def handle_message(event):
                     if days_left < 0:
                         msg = f"🔴 已過截止！\n{name}\n截止日：{deadline.month}/{deadline.day}"
                     elif days_left == 0:
-                        msg = f"🔴 今天截止！\n{name}\n截止日：{deadline.month}/{deadline.day}"
+                        msg = f"🔴 今天截止\n{name}\n截止日：{deadline.month}/{deadline.day}"
                     else:
                         msg = f"⚠️ {name} 距離{deadline.month}/{deadline.day}截止日還有{days_left}天"
                     use_mention = mention_all == "all" or (mention_all == "deadline" and days_left == 0)
@@ -482,6 +564,7 @@ def handle_message(event):
             "• 設定提醒 群組名 編號 提醒設定\n\n"
             "• 設定@all 群組名 編號 截止當天/全部/關閉\n\n"
             "• 刪除 群組名 編號\n\n"
+            "• 結案 群組名 專案名稱（補發慶功訊息）\n\n"
             "• 測試 / 測試 群組名\n\n"
             "📌 群組內指令：\n"
             "• 命名 群組名稱"
@@ -501,7 +584,7 @@ def send_deadline_reminders():
         WHERE p.deadline = %s AND g.name IS NOT NULL
     """, (today,))
     for group_id, name, deadline, mention_all in cur.fetchall():
-        msg = f"🔴 今天截止！\n{name}\n截止日：{deadline.month}/{deadline.day}"
+        msg = f"🔴 今天截止\n{name}\n截止日：{deadline.month}/{deadline.day}"
         try:
             push_message(group_id, msg, use_all_mention=mention_all in ("all", "deadline"))
         except Exception as e:
@@ -517,43 +600,35 @@ def send_advance_reminders():
     conn = get_db()
     cur = conn.cursor()
 
-    # 週五型：彙整成一則訊息
-    if is_friday:
-        cur.execute("""
-            SELECT g.group_id, p.name, p.deadline, p.mention_all
-            FROM projects p JOIN groups g ON p.group_id = g.group_id
-            WHERE p.reminder_type = '週五' AND p.deadline >= %s AND g.name IS NOT NULL
-            ORDER BY g.group_id, p.deadline
-        """, (today,))
-        rows = cur.fetchall()
-        if rows:
-            groups_data = defaultdict(list)
-            for group_id, pname, deadline, mention_all in rows:
-                days_left = (deadline - today).days
-                groups_data[group_id].append((pname, deadline, days_left, mention_all))
-            for group_id, projects in groups_data.items():
-                lines = [f"📅 每週截止日提醒（{today.month}/{today.day}）\n"]
-                for pname, deadline, days_left, _ in projects:
-                    lines.append(f"⚠️ {pname} 距離{deadline.month}/{deadline.day}截止日還有{days_left}天")
-                use_mention = any(m == "all" for _, _, _, m in projects)
-                try:
-                    push_message(group_id, "\n".join(lines), use_all_mention=use_mention)
-                except Exception as e:
-                    print(f"Push error: {e}")
-
-    # 特定天數型
     cur.execute("""
         SELECT g.group_id, p.name, p.deadline, p.reminder_type, p.mention_all
         FROM projects p JOIN groups g ON p.group_id = g.group_id
-        WHERE p.reminder_type != '週五' AND g.name IS NOT NULL
+        WHERE g.name IS NOT NULL
     """)
-    for group_id, name, deadline, reminder_type, mention_all in cur.fetchall():
+    all_projects = cur.fetchall()
+
+    # 週五型：彙整成一則訊息推播
+    if is_friday:
+        weekly_groups = defaultdict(list)
+        for group_id, pname, deadline, reminder_type, mention_all in all_projects:
+            if has_weekly(reminder_type) and deadline >= today:
+                days_left = (deadline - today).days
+                weekly_groups[group_id].append((pname, deadline, days_left, mention_all))
+        for group_id, projects in weekly_groups.items():
+            lines = [f"📅 每週截止日提醒（{today.month}/{today.day}）\n"]
+            for pname, deadline, days_left, _ in projects:
+                lines.append(f"⚠️ {pname} 距離{deadline.month}/{deadline.day}截止日還有{days_left}天")
+            use_mention = any(m == "all" for _, _, _, m in projects)
+            try:
+                push_message(group_id, "\n".join(lines), use_all_mention=use_mention)
+            except Exception as e:
+                print(f"Push error: {e}")
+
+    # 特定天數型（包含混合模式的天數部分）
+    for group_id, name, deadline, reminder_type, mention_all in all_projects:
         days_left = (deadline - today).days
-        try:
-            remind_days = [int(d.strip()) for d in reminder_type.split(",") if d.strip()]
-        except ValueError:
-            remind_days = [7, 5, 3]
-        if days_left in remind_days:
+        remind_days = extract_days(reminder_type)
+        if remind_days and days_left in remind_days:
             msg = f"⚠️ {name} 距離{deadline.month}/{deadline.day}截止日還有{days_left}天"
             try:
                 push_message(group_id, msg, use_all_mention=mention_all == "all")
