@@ -110,7 +110,7 @@ def push_message(group_id, text, use_all_mention=False):
     """推播訊息，可選擇是否 @all"""
     if use_all_mention:
         full_text = "@all\n" + text
-        req.post(
+        resp = req.post(
             "https://api.line.me/v2/bot/message/push",
             headers={
                 "Content-Type": "application/json",
@@ -127,6 +127,8 @@ def push_message(group_id, text, use_all_mention=False):
                 }]
             }
         )
+        if not resp.ok:
+            raise Exception(f"@all push error {resp.status_code}: {resp.text}")
     else:
         line_bot_api.push_message(group_id, TextSendMessage(text=text))
 
@@ -537,7 +539,8 @@ def handle_message(event):
                         push_message(group_id, msg, use_all_mention=use_mention)
                         total += 1
                     except Exception as e:
-                        print(f"Push error: {e}")
+                        print(f"Push error for group {group_id}: {e}")
+                        reply = f"⚠️ 推播失敗：{e}"
             reply = f"✅ 已推播 {total} 則提醒到群組。" if total > 0 else "沒有可推播的專案。"
 
         cur.close()
