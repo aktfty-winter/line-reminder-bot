@@ -128,7 +128,7 @@ def push_message(group_id, text, use_all_mention=False):
             }
         )
         if not resp.ok:
-            raise Exception(f"@all push error {resp.status_code}: {resp.text}")
+            print(f"@all push error {resp.status_code}: {resp.text}")
     else:
         line_bot_api.push_message(group_id, TextSendMessage(text=text))
 
@@ -503,6 +503,27 @@ def handle_message(event):
         else:
             reply = "格式：結案 群組名 專案名稱\n例：結案 法務一組 臨終問答一校"
 
+    # ── 廣播 群組名 訊息內容 ──
+    elif text.startswith("廣播 "):
+        parts = text.split(" ", 2)
+        if len(parts) == 3:
+            group_name, msg_content = parts[1], parts[2]
+            conn = get_db()
+            cur = conn.cursor()
+            group_id = get_group_id_by_name(cur, group_name)
+            cur.close()
+            conn.close()
+            if not group_id:
+                reply = f"找不到群組「{group_name}」。"
+            else:
+                try:
+                    push_message(group_id, msg_content)
+                    reply = f"✅ 已發送訊息到【{group_name}】"
+                except Exception as e:
+                    reply = f"推播失敗：{e}"
+        else:
+            reply = "格式：廣播 群組名 訊息內容\n例：廣播 法務一組 本週五下午三點開會，請準時出席"
+
     # ── 測試 / 測試 群組名 ──
     elif text == "測試" or text.startswith("測試 "):
         conn = get_db()
@@ -539,8 +560,7 @@ def handle_message(event):
                         push_message(group_id, msg, use_all_mention=use_mention)
                         total += 1
                     except Exception as e:
-                        print(f"Push error for group {group_id}: {e}")
-                        reply = f"⚠️ 推播失敗：{e}"
+                        print(f"Push error: {e}")
             reply = f"✅ 已推播 {total} 則提醒到群組。" if total > 0 else "沒有可推播的專案。"
 
         cur.close()
@@ -559,6 +579,7 @@ def handle_message(event):
             "• 設定@all 群組名 編號 截止當天/全部/關閉\n\n"
             "• 刪除 群組名 編號\n\n"
             "• 結案 群組名 專案名稱（補發慶功訊息）\n\n"
+            "• 廣播 群組名 訊息內容\n\n"
             "• 測試 / 測試 群組名\n\n"
             "📌 群組內指令：\n"
             "• 命名 群組名稱"
